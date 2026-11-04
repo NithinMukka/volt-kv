@@ -7,3 +7,10 @@ compile_commands.json
 *.wal
 *.snap
 *.log
+# Ignore any compiled binary starting with test_
+test_*
+
+# NEVER ignore the actual C++ source or header files
+!test_*.cpp
+!test_*.hpp
+!test_*.h
