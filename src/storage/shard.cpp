@@ -44,6 +44,7 @@ Shard::Node* Shard::pop_tail() {
     }
     Node* victim = tail_->prev;
     detach(victim);
+    evictions++;
     return victim;
 }
 
@@ -52,14 +53,16 @@ size_t Shard::size() const {
     return map_.size();
 }
 
-void Shard::set(std::string key, std::string value){
-    std::unique_lock<std::shared_mutex> unique_lock(mutex_);
+void Shard::set(std::string key, std::string value, uint64_t ttl_ms) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    uint64_t expire_at = (ttl_ms > 0) ? (now_ms() + ttl_ms) : 0;
+
     auto it = map_.find(key);
-    if(it != map_.end()){
+    if (it != map_.end()) {
         it->second->value = std::move(value);
+        it->second->expire_at_ms = expire_at;
         move_to_head(it->second);
-    }
-    else{
+    } else {
         if (map_.size() >= capacity_) {
             Node* victim = pop_tail();
             if (victim) {
@@ -67,20 +70,31 @@ void Shard::set(std::string key, std::string value){
                 delete victim;
             }
         }
-        Node* node = new Node{std::move(key), std::move(value)};
+        Node* node = new Node{std::move(key), std::move(value), expire_at};
         attach_head(node);
         map_[node->key] = node;
     }
 }
 
-std::optional<std::string> Shard::get(std::string_view key){
-    std::unique_lock<std::shared_mutex> unique_lock(mutex_);
+std::optional<std::string> Shard::get(std::string_view key) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     auto it = map_.find(key);
-    if(it != map_.end()){
-        move_to_head(it->second);
-        return it->second->value;
+    if (it == map_.end()) {
+        return std::nullopt;
     }
-    return std::nullopt;
+
+    Node* node = it->second;
+
+    // Passive eviction check
+    if (node->expire_at_ms != 0 && now_ms() >= node->expire_at_ms) {
+        detach(node);
+        map_.erase(it);
+        delete node;
+        return std::nullopt;
+    }
+
+    move_to_head(node);
+    return node->value;
 }
 
 bool Shard::del(std::string_view key) {
@@ -94,4 +108,30 @@ bool Shard::del(std::string_view key) {
         return true;
     }
     return false;
+}
+
+size_t Shard::purge_expired(size_t max_to_check) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (map_.empty()) {
+        return 0;
+    }
+
+    size_t keys_purged = 0;
+    size_t keys_checked = 0;
+    uint64_t current_time = now_ms();
+
+    for (auto it = map_.begin(); it != map_.end() && keys_checked < max_to_check; ) {
+        Node* node = it->second;
+        if (node->expire_at_ms != 0 && current_time >= node->expire_at_ms) {
+            detach(node);
+            it = map_.erase(it); // map_.erase(it) returns the next iterator
+            delete node;
+            keys_purged++;
+        } else {
+            ++it;
+        }
+        keys_checked++;
+    }
+
+    return keys_purged;
 }

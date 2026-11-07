@@ -11,9 +11,12 @@ class ShardedStore {
 public:
     explicit ShardedStore(size_t num_shards = 16);
 
-    void set(std::string key, std::string value);
+    void set(std::string key, std::string value, uint64_t ttl_ms = 0); // <-- UPDATED
     std::optional<std::string> get(std::string_view key) const;
     bool del(std::string_view key);
+
+    void purge_all_expired(); // <-- Ensure present
+    size_t total_keys() const; // <-- Ensure present
 
 private:
     size_t shardid(std::string_view key) const;
