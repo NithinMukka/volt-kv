@@ -9,6 +9,7 @@ compile_commands.json
 *.log
 # Ignore any compiled binary starting with test_
 test_*
+manual_tests/
 
 # NEVER ignore the actual C++ source or header files
 !test_*.cpp
