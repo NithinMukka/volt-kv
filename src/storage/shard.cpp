@@ -1,4 +1,5 @@
 #include "storage/shard.hpp"
+#include "metrics/telemetry.hpp"
 #include <mutex>
 
 Shard::Shard(size_t capacity) : capacity_(capacity) {
@@ -44,7 +45,6 @@ Shard::Node* Shard::pop_tail() {
     }
     Node* victim = tail_->prev;
     detach(victim);
-    evictions++;
     return victim;
 }
 
@@ -74,12 +74,15 @@ void Shard::set(std::string key, std::string value, uint64_t ttl_ms) {
         attach_head(node);
         map_[node->key] = node;
     }
+    get_metrics().total_writes.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::optional<std::string> Shard::get(std::string_view key) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    get_metrics().total_reads.fetch_add(1, std::memory_order_relaxed);
     auto it = map_.find(key);
     if (it == map_.end()) {
+        get_metrics().cache_misses.fetch_add(1, std::memory_order_relaxed);
         return std::nullopt;
     }
 
@@ -92,7 +95,7 @@ std::optional<std::string> Shard::get(std::string_view key) {
         delete node;
         return std::nullopt;
     }
-
+    get_metrics().cache_hits.fetch_add(1, std::memory_order_relaxed);
     move_to_head(node);
     return node->value;
 }
@@ -105,6 +108,7 @@ bool Shard::del(std::string_view key) {
         detach(node);
         map_.erase(it);
         delete node;
+        get_metrics().total_deletes.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     return false;

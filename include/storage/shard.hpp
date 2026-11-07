@@ -36,7 +36,6 @@ public:
 
     size_t size() const;
     size_t purge_expired(size_t max_keys_to_check = 50); 
-    size_t evictions = 0;
 
 private:
     struct Node {
