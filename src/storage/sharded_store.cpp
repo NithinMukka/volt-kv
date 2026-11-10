@@ -1,7 +1,9 @@
 #include "storage/sharded_store.hpp"
 #include <functional>
 
-ShardedStore::ShardedStore(size_t num_shards) : num_shards_(num_shards) {
+ShardedStore::ShardedStore(size_t num_shards) 
+    : num_shards_(std::max<size_t>(1, num_shards)) {
+    shards_.reserve(num_shards_);
     for (size_t i = 0; i < num_shards_; ++i) {
         shards_.push_back(std::make_unique<Shard>());
     }

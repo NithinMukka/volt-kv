@@ -1,9 +1,12 @@
 #include "network/event_loop.hpp"
+#include "protocol/parser.hpp"
+#include "metrics/telemetry.hpp"
 #include <sys/socket.h>
-#include <netinet/in.h>   
+#include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
 #include <iostream>
 #include <cerrno>
 
@@ -13,11 +16,12 @@ static bool set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
 }
 
-EventLoop::EventLoop(TcpServer& server) : server_(server) {
+EventLoop::EventLoop(TcpServer& server, ShardedStore& store) 
+    : server_(server), store_(store) {
+    // Fix: Ignore SIGPIPE so disconnects don't kill the server process
+    signal(SIGPIPE, SIG_IGN);
+
     epoll_fd_ = epoll_create1(0);
-    if (epoll_fd_ < 0) {
-        std::cerr << "Failed to create epoll instance\n";
-    }
 }
 
 EventLoop::~EventLoop() {
@@ -34,6 +38,13 @@ void EventLoop::add_to_epoll(int fd, uint32_t events) {
     epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
 }
 
+void EventLoop::modify_epoll(int fd, uint32_t events) {
+    epoll_event ev{};
+    ev.events = events;
+    ev.data.fd = fd;
+    epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev);
+}
+
 void EventLoop::remove_from_epoll(int fd) {
     epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
@@ -41,32 +52,21 @@ void EventLoop::remove_from_epoll(int fd) {
 }
 
 void EventLoop::handle_accept() {
-    // In Edge-Triggered mode, multiple clients may be waiting in the accept queue.
-    // Loop accept() until EAGAIN to accept all queued connections.
     while (true) {
         int client_fd = accept(server_.get_fd(), nullptr, nullptr);
         if (client_fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break; // All pending incoming connections accepted
-            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             break;
         }
 
         set_nonblocking(client_fd);
 
-        // TCP_NODELAY: disable Nagle's algorithm for low-latency request-response
         int flag = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
-        // Register for Edge-Triggered reading
         add_to_epoll(client_fd, EPOLLIN | EPOLLET);
-
         connections_[client_fd] = Connection{client_fd, "", ""};
     }
-}
-
-void EventLoop::stop() {
-    running_.store(false);
 }
 
 void EventLoop::handle_read(int client_fd) {
@@ -74,48 +74,129 @@ void EventLoop::handle_read(int client_fd) {
     if (it == connections_.end()) return;
 
     Connection& conn = it->second;
-    char buffer[4096];
+    char buffer[16384];
 
     while (true) {
         ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer));
 
         if (bytes_read > 0) {
             conn.read_buffer.append(buffer, bytes_read);
+
+            // Defense: Slowloris memory cap
+            if (conn.read_buffer.size() > MAX_READ_BUFFER) {
+                remove_from_epoll(client_fd);
+                return;
+            }
         } else if (bytes_read == 0) {
             remove_from_epoll(client_fd);
             return;
         } else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break; // Socket drained
+                break;
             }
             remove_from_epoll(client_fd);
             return;
         }
     }
 
-    // Process all complete lines ending with '\n'
-    size_t newline_pos;
-    while ((newline_pos = conn.read_buffer.find('\n')) != std::string::npos) {
-        std::string line = conn.read_buffer.substr(0, newline_pos + 1);
-        conn.read_buffer.erase(0, newline_pos + 1);
+    process_pipeline(conn);
+}
 
-        // Echo response: "+PONG: " + line
-        std::string response = "+PONG: " + line;
-        write(client_fd, response.data(), response.size());
+void EventLoop::process_pipeline(Connection& conn) {
+    size_t newline_pos;
+    size_t commands_processed = 0;
+    constexpr size_t MAX_BATCH_COMMANDS = 16; // Fairness cap per event loop tick
+
+    while (commands_processed < MAX_BATCH_COMMANDS && 
+          (newline_pos = conn.read_buffer.find('\n')) != std::string::npos) {
+        
+        std::string raw_line = conn.read_buffer.substr(0, newline_pos + 1);
+        conn.read_buffer.erase(0, newline_pos + 1);
+        commands_processed++;
+
+        Command cmd = ProtocolParser::parse(raw_line);
+        std::string reply;
+
+        switch (cmd.type) {
+            case CommandType::SET:
+                store_.set(std::move(cmd.key), std::move(cmd.value), cmd.ttl_ms);
+                reply = "+OK\r\n";
+                break;
+
+            case CommandType::GET: {
+                auto val = store_.get(cmd.key);
+                if (val.has_value()) {
+                    reply = "$" + std::to_string(val.value().size()) + "\r\n" + val.value() + "\r\n";
+                } else {
+                    reply = "$-1\r\n";
+                }
+                break;
+            }
+
+            case CommandType::DEL: {
+                bool deleted = store_.del(cmd.key);
+                reply = deleted ? ":1\r\n" : ":0\r\n";
+                break;
+            }
+
+            case CommandType::STATS: {
+                auto& m = get_metrics();
+                reply = "reads:" + std::to_string(m.total_reads.load()) +
+                        " writes:" + std::to_string(m.total_writes.load()) +
+                        " hits:" + std::to_string(m.cache_hits.load()) +
+                        " misses:" + std::to_string(m.cache_misses.load()) + "\r\n";
+                break;
+            }
+
+            case CommandType::UNKNOWN:
+            default:
+                reply = "-" + cmd.error_message + "\r\n";
+                break;
+        }
+
+        conn.write_buffer.append(reply);
+    }
+
+    // Flush response via non-blocking write
+    if (!conn.write_buffer.empty()) {
+        handle_write(conn.fd);
     }
 }
 
+void EventLoop::handle_write(int client_fd) {
+    auto it = connections_.find(client_fd);
+    if (it == connections_.end()) return;
+
+    Connection& conn = it->second;
+
+    while (!conn.write_buffer.empty()) {
+        ssize_t bytes_sent = send(client_fd, conn.write_buffer.data(), conn.write_buffer.size(), MSG_NOSIGNAL);
+
+        if (bytes_sent > 0) {
+            conn.write_buffer.erase(0, bytes_sent);
+        } else if (bytes_sent == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // OS send buffer full: register EPOLLOUT to wake up when writable
+                modify_epoll(client_fd, EPOLLIN | EPOLLOUT | EPOLLET);
+                return;
+            }
+            remove_from_epoll(client_fd);
+            return;
+        }
+    }
+
+    // Write buffer drained: revert back to waiting for reads only
+    modify_epoll(client_fd, EPOLLIN | EPOLLET);
+}
+
 void EventLoop::run() {
-    // 1. Register the listening server socket with epoll
     add_to_epoll(server_.get_fd(), EPOLLIN | EPOLLET);
     running_.store(true);
 
-    std::cout << "[EventLoop] Started polling on epoll fd: " << epoll_fd_ << "\n";
-
     while (running_.load()) {
-        int n_fds = epoll_wait(epoll_fd_, events_, MAX_EVENTS, 100 /* timeout ms */);
+        int n_fds = epoll_wait(epoll_fd_, events_, MAX_EVENTS, 100);
         if (n_fds < 0) {
-            if (errno == EINTR) continue; // Interrupted by system signal, retry
+            if (errno == EINTR) continue;
             break;
         }
 
@@ -128,10 +209,19 @@ void EventLoop::run() {
             } else {
                 if (ev & (EPOLLERR | EPOLLHUP)) {
                     remove_from_epoll(fd);
-                } else if (ev & EPOLLIN) {
-                    handle_read(fd);
+                } else {
+                    if (ev & EPOLLIN) {
+                        handle_read(fd);
+                    }
+                    if (ev & EPOLLOUT) {
+                        handle_write(fd);
+                    }
                 }
             }
         }
     }
+}
+
+void EventLoop::stop() {
+    running_.store(false);
 }

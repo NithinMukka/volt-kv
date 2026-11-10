@@ -8,6 +8,11 @@ TTLCleaner::~TTLCleaner() {
 }
 
 void TTLCleaner::start() {
+    std::lock_guard<std::mutex> lock(cv_mutex_);
+    if (worker_thread_.joinable()) {
+        return; // Already running
+    }
+    stop_flag_ = false;
     worker_thread_ = std::thread(&TTLCleaner::run, this);
 }
 
