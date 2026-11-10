@@ -44,8 +44,7 @@ bool WalManager::sync() {
 }
 
 bool WalManager::append_set(std::string_view key, std::string_view val, uint64_t expire_at_ms) {
-    uint64_t ts = (expire_at_ms > 0) ? expire_at_ms : now_ms();
-    return write_record(WalOpType::SET, key, val, ts);
+    return write_record(WalOpType::SET, key, val, expire_at_ms);
 }
 
 bool WalManager::append_del(std::string_view key) {

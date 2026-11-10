@@ -3,13 +3,14 @@
 #include "network/tcp_server.hpp"
 #include "network/connection.hpp"
 #include "storage/sharded_store.hpp"
+#include "persistence/wal_manager.hpp"
 #include <sys/epoll.h>
 #include <unordered_map>
 #include <atomic>
 
 class EventLoop {
 public:
-    explicit EventLoop(TcpServer& server, ShardedStore& store);
+    explicit EventLoop(TcpServer& server, ShardedStore& store, WalManager& wal);
     ~EventLoop();
 
     void run();
@@ -27,11 +28,12 @@ private:
 
     TcpServer& server_;
     ShardedStore& store_;
+    WalManager& wal_;
     int epoll_fd_{-1};
     std::atomic<bool> running_{false};
     std::unordered_map<int, Connection> connections_;
 
     static constexpr int MAX_EVENTS = 1024;
-    static constexpr size_t MAX_READ_BUFFER = 64 * 1024 * 1024; // 64 MB hard buffer ceiling
+    static constexpr size_t MAX_READ_BUFFER = 64 * 1024 * 1024;
     struct epoll_event events_[MAX_EVENTS];
 };

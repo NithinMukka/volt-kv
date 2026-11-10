@@ -16,11 +16,9 @@ static bool set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
 }
 
-EventLoop::EventLoop(TcpServer& server, ShardedStore& store) 
-    : server_(server), store_(store) {
-    // Fix: Ignore SIGPIPE so disconnects don't kill the server process
+EventLoop::EventLoop(TcpServer& server, ShardedStore& store, WalManager& wal) 
+    : server_(server), store_(store), wal_(wal) {
     signal(SIGPIPE, SIG_IGN);
-
     epoll_fd_ = epoll_create1(0);
 }
 
@@ -82,7 +80,6 @@ void EventLoop::handle_read(int client_fd) {
         if (bytes_read > 0) {
             conn.read_buffer.append(buffer, bytes_read);
 
-            // Defense: Slowloris memory cap
             if (conn.read_buffer.size() > MAX_READ_BUFFER) {
                 remove_from_epoll(client_fd);
                 return;
@@ -105,7 +102,7 @@ void EventLoop::handle_read(int client_fd) {
 void EventLoop::process_pipeline(Connection& conn) {
     size_t newline_pos;
     size_t commands_processed = 0;
-    constexpr size_t MAX_BATCH_COMMANDS = 16; // Fairness cap per event loop tick
+    constexpr size_t MAX_BATCH_COMMANDS = 16;
 
     while (commands_processed < MAX_BATCH_COMMANDS && 
           (newline_pos = conn.read_buffer.find('\n')) != std::string::npos) {
@@ -118,10 +115,19 @@ void EventLoop::process_pipeline(Connection& conn) {
         std::string reply;
 
         switch (cmd.type) {
-            case CommandType::SET:
+            case CommandType::SET: {
+                uint64_t expire_at = (cmd.ttl_ms > 0) ? (now_ms() + cmd.ttl_ms) : 0;
+                
+                // Durability Invariant: Log to WAL before touching RAM
+                if (!wal_.append_set(cmd.key, cmd.value, expire_at)) {
+                    reply = "-ERR WAL disk write failed\r\n";
+                    break;
+                }
+                
                 store_.set(std::move(cmd.key), std::move(cmd.value), cmd.ttl_ms);
                 reply = "+OK\r\n";
                 break;
+            }
 
             case CommandType::GET: {
                 auto val = store_.get(cmd.key);
@@ -134,6 +140,12 @@ void EventLoop::process_pipeline(Connection& conn) {
             }
 
             case CommandType::DEL: {
+                // Durability Invariant: Log deletion before touching RAM
+                if (!wal_.append_del(cmd.key)) {
+                    reply = "-ERR WAL disk write failed\r\n";
+                    break;
+                }
+
                 bool deleted = store_.del(cmd.key);
                 reply = deleted ? ":1\r\n" : ":0\r\n";
                 break;
@@ -157,7 +169,6 @@ void EventLoop::process_pipeline(Connection& conn) {
         conn.write_buffer.append(reply);
     }
 
-    // Flush response via non-blocking write
     if (!conn.write_buffer.empty()) {
         handle_write(conn.fd);
     }
@@ -176,7 +187,6 @@ void EventLoop::handle_write(int client_fd) {
             conn.write_buffer.erase(0, bytes_sent);
         } else if (bytes_sent == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // OS send buffer full: register EPOLLOUT to wake up when writable
                 modify_epoll(client_fd, EPOLLIN | EPOLLOUT | EPOLLET);
                 return;
             }
@@ -185,7 +195,6 @@ void EventLoop::handle_write(int client_fd) {
         }
     }
 
-    // Write buffer drained: revert back to waiting for reads only
     modify_epoll(client_fd, EPOLLIN | EPOLLET);
 }
 
