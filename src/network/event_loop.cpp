@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <iostream>
 #include <cerrno>
+#include <arpa/inet.h>
 
 static bool set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -51,11 +52,18 @@ void EventLoop::remove_from_epoll(int fd) {
 
 void EventLoop::handle_accept() {
     while (true) {
-        int client_fd = accept(server_.get_fd(), nullptr, nullptr);
+        sockaddr_in client_addr{};
+        socklen_t addr_len = sizeof(client_addr);
+
+        int client_fd = accept(server_.get_fd(), reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
         if (client_fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             break;
         }
+
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(client_addr.sin_addr), ip_str, INET_ADDRSTRLEN);
+        std::string client_ip(ip_str);
 
         set_nonblocking(client_fd);
 
@@ -63,7 +71,7 @@ void EventLoop::handle_accept() {
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
         add_to_epoll(client_fd, EPOLLIN | EPOLLET);
-        connections_[client_fd] = Connection{client_fd, "", ""};
+        connections_[client_fd] = Connection{client_fd, std::move(client_ip), "", ""};
     }
 }
 

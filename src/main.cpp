@@ -4,6 +4,7 @@
 #include "storage/ttl_cleaner.hpp"
 #include "persistence/wal_manager.hpp"
 #include "persistence/wal_recovery.hpp"
+#include "persistence/snapshot.hpp"
 #include <iostream>
 #include <csignal>
 #include <atomic>
@@ -17,19 +18,26 @@ void signal_handler(int) {
 }
 
 int main() {
+    const std::string snap_path = "voltkv.snap";
     const std::string wal_path = "voltkv.wal";
 
-    // 1. Initialize in-memory storage
     ShardedStore store(16);
 
-    // 2. Crash Recovery: Reconstruct state from WAL before accepting connections
-    RecoveryStats stats;
+    // 1. Restore baseline state from Snapshot (if exists)
+    SnapshotStats snap_stats;
+    std::cout << "[VoltKV] Checking for snapshot at " << snap_path << "...\n";
+    if (SnapshotManager::load_snapshot(snap_path, store, snap_stats) && snap_stats.keys_saved > 0) {
+        std::cout << "[VoltKV] Loaded snapshot: " << snap_stats.keys_saved << " keys restored.\n";
+    }
+
+    // 2. Replay subsequent mutating transactions from WAL
+    RecoveryStats wal_stats;
     std::cout << "[VoltKV] Replaying WAL from " << wal_path << "...\n";
-    if (WalRecovery::recover(wal_path, store, stats)) {
-        std::cout << "[VoltKV] Replay complete: " << stats.records_replayed 
-                  << " records restored (" << stats.set_ops << " sets, " 
-                  << stats.del_ops << " dels).\n";
-        if (stats.torn_tail_detected) {
+    if (WalRecovery::recover(wal_path, store, wal_stats)) {
+        std::cout << "[VoltKV] WAL replay complete: " << wal_stats.records_replayed 
+                  << " records restored (" << wal_stats.set_ops << " sets, " 
+                  << wal_stats.del_ops << " dels).\n";
+        if (wal_stats.torn_tail_detected) {
             std::cout << "[VoltKV] Warning: Corrupted tail detected and truncated.\n";
         }
     }

@@ -1,4 +1,5 @@
 build/
+build_tsan/
 bin/
 lib/
 compile_commands.json
