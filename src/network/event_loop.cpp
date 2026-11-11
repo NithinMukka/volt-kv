@@ -4,12 +4,12 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
 #include <iostream>
 #include <cerrno>
-#include <arpa/inet.h>
 
 static bool set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -17,8 +17,9 @@ static bool set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
 }
 
-EventLoop::EventLoop(TcpServer& server, ShardedStore& store, WalManager& wal) 
-    : server_(server), store_(store), wal_(wal) {
+// Notice the colon ':' initialization list. References MUST be initialized here.
+EventLoop::EventLoop(TcpServer& server, ShardedStore& store, WalManager& wal, RateLimiter& limiter) 
+    : server_(server), store_(store), wal_(wal), limiter_(limiter) {
     signal(SIGPIPE, SIG_IGN);
     epoll_fd_ = epoll_create1(0);
 }
@@ -119,6 +120,13 @@ void EventLoop::process_pipeline(Connection& conn) {
         conn.read_buffer.erase(0, newline_pos + 1);
         commands_processed++;
 
+        // 1. Check Rate Limit (inside the loop so continue works)
+        if (!limiter_.allow(conn.client_ip)) {
+            conn.write_buffer.append("-ERR rate limit exceeded\r\n");
+            continue;
+        }
+
+        // 2. Parse command
         Command cmd = ProtocolParser::parse(raw_line);
         std::string reply;
 
@@ -126,7 +134,6 @@ void EventLoop::process_pipeline(Connection& conn) {
             case CommandType::SET: {
                 uint64_t expire_at = (cmd.ttl_ms > 0) ? (now_ms() + cmd.ttl_ms) : 0;
                 
-                // Durability Invariant: Log to WAL before touching RAM
                 if (!wal_.append_set(cmd.key, cmd.value, expire_at)) {
                     reply = "-ERR WAL disk write failed\r\n";
                     break;
@@ -148,7 +155,6 @@ void EventLoop::process_pipeline(Connection& conn) {
             }
 
             case CommandType::DEL: {
-                // Durability Invariant: Log deletion before touching RAM
                 if (!wal_.append_del(cmd.key)) {
                     reply = "-ERR WAL disk write failed\r\n";
                     break;

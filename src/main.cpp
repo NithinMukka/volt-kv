@@ -59,9 +59,11 @@ int main() {
         std::cerr << "[VoltKV] Fatal: Failed to start TCP server on port 8080\n";
         return 1;
     }
+    // 6. Rate limiter
+    RateLimiter limiter(500.0, 1000.0);
 
-    // 6. Event loop
-    EventLoop loop(server, store, wal);
+    // 7. Event loop
+    EventLoop loop(server, store, wal, limiter);
     g_loop.store(&loop);
 
     std::signal(SIGINT, signal_handler);

@@ -7,10 +7,11 @@
 #include <sys/epoll.h>
 #include <unordered_map>
 #include <atomic>
+#include "protocol/rate_limiter.hpp"
 
 class EventLoop {
 public:
-    explicit EventLoop(TcpServer& server, ShardedStore& store, WalManager& wal);
+    explicit EventLoop(TcpServer& server, ShardedStore& store, WalManager& wal, RateLimiter& limiter);
     ~EventLoop();
 
     void run();
@@ -29,6 +30,7 @@ private:
     TcpServer& server_;
     ShardedStore& store_;
     WalManager& wal_;
+    RateLimiter& limiter_;
     int epoll_fd_{-1};
     std::atomic<bool> running_{false};
     std::unordered_map<int, Connection> connections_;
