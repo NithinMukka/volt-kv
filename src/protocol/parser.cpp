@@ -57,21 +57,33 @@ Command ProtocolParser::parse(std::string_view raw_line) {
         return {CommandType::UNKNOWN, "", "", 0, "ERR empty command"};
     }
 
-    // ------------------------------------------------------------------------
-    // GET <key>
+// ------------------------------------------------------------------------
+    // GET <key>  OR  GET /keys/<key> HTTP/1.1
     // ------------------------------------------------------------------------
     if (iequals(verb, "GET")) {
-        auto [key, extra] = next_token(rest);
-        if (key.empty()) {
-            return {CommandType::UNKNOWN, "", "", 0, "ERR wrong number of arguments for 'GET'"};
+        auto [first_arg, extra] = next_token(rest);
+        if (first_arg.empty()) {
+            return {CommandType::UNKNOWN, "", "", 0, "ERR wrong number of arguments for 'GET'", false};
         }
+
+        // Detect HTTP/1.1 REST request
+        if (first_arg.rfind("/keys/", 0) == 0 || first_arg.rfind("/get/", 0) == 0) {
+            size_t prefix_len = (first_arg.rfind("/keys/", 0) == 0) ? 6 : 5;
+            std::string_view key = first_arg.substr(prefix_len);
+            if (key.empty() || key.size() > MAX_KEY_SIZE) {
+                return {CommandType::UNKNOWN, "", "", 0, "ERR invalid key", true};
+            }
+            return {CommandType::GET, std::string(key), "", 0, "", true};
+        }
+
+        // Standard Inline: GET <key>
         if (!trim_leading_spaces(extra).empty()) {
-            return {CommandType::UNKNOWN, "", "", 0, "ERR wrong number of arguments for 'GET'"};
+            return {CommandType::UNKNOWN, "", "", 0, "ERR wrong number of arguments for 'GET'", false};
         }
-        if (key.size() > MAX_KEY_SIZE) {
-            return {CommandType::UNKNOWN, "", "", 0, "ERR key too large"};
+        if (first_arg.size() > MAX_KEY_SIZE) {
+            return {CommandType::UNKNOWN, "", "", 0, "ERR key too large", false};
         }
-        return {CommandType::GET, std::string(key), "", 0, ""};
+        return {CommandType::GET, std::string(first_arg), "", 0, "", false};
     }
 
     // ------------------------------------------------------------------------

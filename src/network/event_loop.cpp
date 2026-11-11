@@ -109,41 +109,84 @@ void EventLoop::handle_read(int client_fd) {
 }
 
 void EventLoop::process_pipeline(Connection& conn) {
-    size_t newline_pos;
-    size_t commands_processed = 0;
     constexpr size_t MAX_BATCH_COMMANDS = 16;
+    size_t commands_processed = 0;
 
-    while (commands_processed < MAX_BATCH_COMMANDS && 
-          (newline_pos = conn.read_buffer.find('\n')) != std::string::npos) {
-        
+    while (commands_processed < MAX_BATCH_COMMANDS) {
+        // --------------------------------------------------------------------
+        // Path A: HTTP/1.1 Request (Delimiter is "\r\n\r\n" or "\n\n")
+        // --------------------------------------------------------------------
+        if (conn.read_buffer.rfind("GET /", 0) == 0 || conn.read_buffer.rfind("get /", 0) == 0) {
+            size_t header_end = conn.read_buffer.find("\r\n\r\n");
+            size_t delim_len = 4;
+            if (header_end == std::string::npos) {
+                header_end = conn.read_buffer.find("\n\n");
+                delim_len = 2;
+            }
+
+            // Need full HTTP header block before processing
+            if (header_end == std::string::npos) {
+                break;
+            }
+
+            // Extract the first line (e.g., "GET /keys/test HTTP/1.1")
+            size_t first_line_end = conn.read_buffer.find('\n');
+            std::string first_line = conn.read_buffer.substr(0, first_line_end + 1);
+
+            // Erase the ENTIRE HTTP header block (including Host, User-Agent, etc.)
+            conn.read_buffer.erase(0, header_end + delim_len);
+            commands_processed++;
+
+            if (!limiter_.allow(conn.client_ip)) {
+                conn.write_buffer.append("HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n");
+                continue;
+            }
+
+            Command cmd = ProtocolParser::parse(first_line);
+            auto val = store_.get(cmd.key);
+            if (val.has_value()) {
+                conn.write_buffer.append(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
+                    std::to_string(val.value().size()) + "\r\nConnection: keep-alive\r\n\r\n" +
+                    val.value()
+                );
+            } else {
+                conn.write_buffer.append("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n");
+            }
+            continue;
+        }
+
+        // --------------------------------------------------------------------
+        // Path B: Standard Raw Inline Commands (Delimiter is '\n')
+        // --------------------------------------------------------------------
+        size_t newline_pos = conn.read_buffer.find('\n');
+        if (newline_pos == std::string::npos) {
+            break;
+        }
+
         std::string raw_line = conn.read_buffer.substr(0, newline_pos + 1);
         conn.read_buffer.erase(0, newline_pos + 1);
         commands_processed++;
 
-        // 1. Check Rate Limit (inside the loop so continue works)
         if (!limiter_.allow(conn.client_ip)) {
             conn.write_buffer.append("-ERR rate limit exceeded\r\n");
             continue;
         }
 
-        // 2. Parse command
         Command cmd = ProtocolParser::parse(raw_line);
         std::string reply;
 
         switch (cmd.type) {
             case CommandType::SET: {
                 uint64_t expire_at = (cmd.ttl_ms > 0) ? (now_ms() + cmd.ttl_ms) : 0;
-                
                 if (!wal_.append_set(cmd.key, cmd.value, expire_at)) {
                     reply = "-ERR WAL disk write failed\r\n";
                     break;
                 }
-                
                 store_.set(std::move(cmd.key), std::move(cmd.value), cmd.ttl_ms);
                 reply = "+OK\r\n";
                 break;
             }
-
             case CommandType::GET: {
                 auto val = store_.get(cmd.key);
                 if (val.has_value()) {
@@ -153,18 +196,15 @@ void EventLoop::process_pipeline(Connection& conn) {
                 }
                 break;
             }
-
             case CommandType::DEL: {
                 if (!wal_.append_del(cmd.key)) {
                     reply = "-ERR WAL disk write failed\r\n";
                     break;
                 }
-
                 bool deleted = store_.del(cmd.key);
                 reply = deleted ? ":1\r\n" : ":0\r\n";
                 break;
             }
-
             case CommandType::STATS: {
                 auto& m = get_metrics();
                 reply = "reads:" + std::to_string(m.total_reads.load()) +
@@ -173,7 +213,6 @@ void EventLoop::process_pipeline(Connection& conn) {
                         " misses:" + std::to_string(m.cache_misses.load()) + "\r\n";
                 break;
             }
-
             case CommandType::UNKNOWN:
             default:
                 reply = "-" + cmd.error_message + "\r\n";

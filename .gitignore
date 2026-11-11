@@ -1,5 +1,7 @@
 build/
 build_tsan/
+build_asan/
+build_release/
 bin/
 lib/
 compile_commands.json

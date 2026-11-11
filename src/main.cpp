@@ -61,6 +61,7 @@ int main() {
     }
     // 6. Rate limiter
     RateLimiter limiter(500.0, 1000.0);
+    limiter.whitelist_ip("127.0.0.1"); // <-- Must be present for local benchmark
 
     // 7. Event loop
     EventLoop loop(server, store, wal, limiter);
