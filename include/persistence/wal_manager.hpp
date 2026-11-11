@@ -37,6 +37,8 @@ public:
     bool sync();
 
     const std::string& get_filepath() const { return filepath_; }
+    // Truncates WAL file to 0 bytes after successful snapshot
+    bool reset();
 
 private:
     bool write_record(WalOpType op, std::string_view key, std::string_view val, uint64_t timestamp);

@@ -6,17 +6,21 @@
 #include <string>
 #include <string_view>
 #include <optional>
+#include <cstdint>
 
 class ShardedStore {
 public:
     explicit ShardedStore(size_t num_shards = 16);
 
-    void set(std::string key, std::string value, uint64_t ttl_ms = 0); // <-- UPDATED
+    void set(std::string key, std::string value, uint64_t ttl_ms = 0);
     std::optional<std::string> get(std::string_view key) const;
     bool del(std::string_view key);
 
-    void purge_all_expired(); // <-- Ensure present
-    size_t total_keys() const; // <-- Ensure present
+    void purge_all_expired();
+    size_t total_keys() const;
+
+    // True atomic snapshot across all shards simultaneously
+    std::vector<Shard::SnapshotEntry> capture_snapshot();
 
 private:
     size_t shardid(std::string_view key) const;

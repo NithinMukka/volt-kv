@@ -7,6 +7,7 @@
 #include <optional>
 #include <cstdint>
 #include <chrono>
+#include <vector>
 
 struct StringHash {
     using is_transparent = void;
@@ -15,7 +16,6 @@ struct StringHash {
     }
 };
 
-// Monotonic clock immune to NTP adjustments
 inline uint64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()
@@ -24,6 +24,12 @@ inline uint64_t now_ms() {
 
 class Shard {
 public:
+    struct SnapshotEntry {
+        std::string key;
+        std::string value;
+        uint64_t expire_at_ms = 0;
+    };
+
     explicit Shard(size_t capacity = 1000);
     ~Shard();
 
@@ -36,6 +42,11 @@ public:
 
     size_t size() const;
     size_t purge_expired(size_t max_keys_to_check = 50);
+
+    // Dumps entries (assumes caller holds mutex_)
+    void dump_entries_unlocked(std::vector<SnapshotEntry>& out) const;
+
+    std::shared_mutex& get_mutex() { return mutex_; }
 
 private:
     struct Node {
@@ -58,6 +69,6 @@ private:
     Node* head_;
     Node* tail_;
 
-    // Cursor for TTL sweeping to avoid starvation
-    typename std::unordered_map<std::string, Node*, StringHash, std::equal_to<>>::iterator sweep_cursor_;
+    // Safe integer cursor: immune to iterator invalidation/rehashing
+    size_t sweep_bucket_{0};
 };

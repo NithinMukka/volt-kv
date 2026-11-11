@@ -122,3 +122,19 @@ bool WalManager::write_record(WalOpType op, std::string_view key, std::string_vi
 
     return true;
 }
+
+bool WalManager::reset() {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    if (fd_ < 0) return false;
+
+    // Truncate file to 0 bytes and seek pointer back to beginning
+    if (::ftruncate(fd_, 0) != 0) {
+        std::cerr << "[WalManager] Failed to truncate WAL file: " << strerror(errno) << "\n";
+        return false;
+    }
+    if (::lseek(fd_, 0, SEEK_SET) == -1) {
+        std::cerr << "[WalManager] Failed to seek to start: " << strerror(errno) << "\n";
+        return false;
+    }
+    return ::fsync(fd_) == 0;
+}

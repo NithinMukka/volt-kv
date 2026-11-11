@@ -8,7 +8,6 @@ Shard::Shard(size_t capacity) : capacity_(std::max<size_t>(1, capacity)) {
     tail_ = new Node();
     head_->next = tail_;
     tail_->prev = head_;
-    sweep_cursor_ = map_.end();
 }
 
 Shard::~Shard() {
@@ -56,7 +55,6 @@ size_t Shard::size() const {
 void Shard::set(std::string key, std::string value, uint64_t ttl_ms) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
 
-    // Clamp against uint64_t overflow
     uint64_t current = now_ms();
     uint64_t expire_at = 0;
     if (ttl_ms > 0) {
@@ -76,30 +74,18 @@ void Shard::set(std::string key, std::string value, uint64_t ttl_ms) {
         if (map_.size() >= capacity_) {
             Node* victim = pop_tail();
             if (victim) {
-                // If cursor pointed to the evicted node, advance it
-                auto victim_it = map_.find(victim->key);
-                if (victim_it != map_.end()) {
-                    if (sweep_cursor_ == victim_it) {
-                        sweep_cursor_ = map_.erase(victim_it);
-                    } else {
-                        map_.erase(victim_it);
-                    }
-                }
+                map_.erase(victim->key);
                 delete victim;
             }
         }
 
-        // Allocate node
         Node* node = new Node{std::move(key), std::move(value), expire_at};
-
-        // Insert into map first (exception safety)
         try {
             map_[node->key] = node;
         } catch (...) {
             delete node;
             throw;
         }
-
         attach_head(node);
     }
 
@@ -120,11 +106,7 @@ std::optional<std::string> Shard::get(std::string_view key) {
 
     if (node->expire_at_ms != 0 && now_ms() >= node->expire_at_ms) {
         detach(node);
-        if (sweep_cursor_ == it) {
-            sweep_cursor_ = map_.erase(it);
-        } else {
-            map_.erase(it);
-        }
+        map_.erase(it);
         delete node;
         get_metrics().cache_misses.fetch_add(1, std::memory_order_relaxed);
         return std::nullopt;
@@ -141,11 +123,7 @@ bool Shard::del(std::string_view key) {
     if (it != map_.end()) {
         Node* node = it->second;
         detach(node);
-        if (sweep_cursor_ == it) {
-            sweep_cursor_ = map_.erase(it);
-        } else {
-            map_.erase(it);
-        }
+        map_.erase(it);
         delete node;
         get_metrics().total_deletes.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -153,36 +131,54 @@ bool Shard::del(std::string_view key) {
     return false;
 }
 
-// Cursor-based sweep avoids starvation at map_.begin()
+// Bucket-index sweeping: Immune to rehashing and iterator invalidation
 size_t Shard::purge_expired(size_t max_keys_to_check) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    if (map_.empty()) {
-        sweep_cursor_ = map_.end();
-        return 0;
-    }
+    if (map_.empty()) return 0;
 
     size_t keys_purged = 0;
     size_t keys_checked = 0;
     uint64_t current = now_ms();
+    size_t num_buckets = map_.bucket_count();
 
-    while (keys_checked < max_keys_to_check && !map_.empty()) {
-        if (sweep_cursor_ == map_.end()) {
-            sweep_cursor_ = map_.begin();
+    if (num_buckets == 0) return 0;
+
+    size_t starting_bucket = sweep_bucket_ % num_buckets;
+    size_t current_bucket = starting_bucket;
+
+    do {
+        for (auto it = map_.begin(current_bucket); it != map_.end(current_bucket); ) {
+            Node* node = it->second;
+            if (node->expire_at_ms != 0 && current >= node->expire_at_ms) {
+                detach(node);
+                std::string k = node->key;
+                ++it;
+                map_.erase(k);
+                delete node;
+                keys_purged++;
+            } else {
+                ++it;
+            }
+
+            keys_checked++;
+            if (keys_checked >= max_keys_to_check) {
+                sweep_bucket_ = current_bucket;
+                return keys_purged;
+            }
         }
 
-        auto it = sweep_cursor_;
-        Node* node = it->second;
+        current_bucket = (current_bucket + 1) % num_buckets;
+    } while (current_bucket != starting_bucket && keys_checked < max_keys_to_check);
 
-        if (node->expire_at_ms != 0 && current >= node->expire_at_ms) {
-            detach(node);
-            sweep_cursor_ = map_.erase(it);
-            delete node;
-            keys_purged++;
-        } else {
-            ++sweep_cursor_;
-        }
-        keys_checked++;
-    }
-
+    sweep_bucket_ = current_bucket;
     return keys_purged;
+}
+
+void Shard::dump_entries_unlocked(std::vector<SnapshotEntry>& out) const {
+    uint64_t current = now_ms();
+    for (const auto& [key, node] : map_) {
+        if (node->expire_at_ms == 0 || node->expire_at_ms > current) {
+            out.push_back({node->key, node->value, node->expire_at_ms});
+        }
+    }
 }

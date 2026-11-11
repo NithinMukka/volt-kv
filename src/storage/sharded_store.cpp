@@ -1,5 +1,7 @@
 #include "storage/sharded_store.hpp"
 #include <functional>
+#include <algorithm>
+#include <shared_mutex>
 
 ShardedStore::ShardedStore(size_t num_shards) 
     : num_shards_(std::max<size_t>(1, num_shards)) {
@@ -40,4 +42,23 @@ size_t ShardedStore::total_keys() const {
         total += shard->size();
     }
     return total;
+}
+
+// Atomically captures state across all shards simultaneously
+std::vector<Shard::SnapshotEntry> ShardedStore::capture_snapshot() {
+    // 1. Acquire shared locks on all shards strictly in ascending order (prevents deadlock)
+    std::vector<std::shared_lock<std::shared_mutex>> locks;
+    locks.reserve(shards_.size());
+    for (const auto& shard : shards_) {
+        locks.emplace_back(shard->get_mutex());
+    }
+
+    // 2. Extract entries from all shards under global read consistency
+    std::vector<Shard::SnapshotEntry> all_entries;
+    for (const auto& shard : shards_) {
+        shard->dump_entries_unlocked(all_entries);
+    }
+
+    // 3. Locks automatically unlock here when 'locks' vector destructs
+    return all_entries;
 }
